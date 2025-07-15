@@ -38,10 +38,13 @@ SENSOR_DATABASE = {
     },
     "OMH3150S": {
         "type": "magnitude",
-        "sensitivity": 1.4,  # mV/mT
+        "sensitivity": 35,  # mV/mT (legacy - not used with new transfer function)
         "axis": "xyz",
         "height_offset": 0.001,
-        "max_drift": 0.01,  # 1% max drift over full measurement
+        "max_drift": 0.05,  # 5% max drift over full measurement
+        "field_range_mT": (-80, 80),  # -800 to +800 Gauss
+        "voltage_range_V": (0.5, 4.5),  # Output voltage range
+        "transfer_function": lambda B_mT: max(0.5, min(4.5, 0.025 * B_mT + 2.5))  # Linear with clamping
     },
     "TMAG5170": {
         "type": "3-axis",
@@ -74,6 +77,9 @@ CYLINDER_RADIUS = (9.6/2.0)+0.155 # in
 STROKE = 18 # in
 RESOLUTION = 0.05 #in
 _RESOLUTION = int(STROKE/RESOLUTION)
+
+# Control whether to run single test with plotting or parameter sweep
+RUN_SWEEP = False  # Set to True for parameter sweep, False for single test with plotting
 
 class MagnetRing(magpy.Collection):
     def __init__(self, radius, magradius, magheight, magnet_type, disks=6, orientation='radius', magnetization='z', temperature=20, hc_variation=0.05, **kwargs):
@@ -127,11 +133,11 @@ class MagnetRing(magpy.Collection):
             )
             
             if self.magnet_orientation == 'x':
-                child.orientation = R.from_rotvec((0, 90, 0), degrees=True)
+                child.orientation = R.from_rotvec((0, 0, 90), degrees=True)
             elif self.magnet_orientation == 'y':
                 child.orientation = R.from_rotvec((90, 0, 0), degrees=True)
             else:  # 'radius' (radial orientation)
-                pass
+                child.orientation = R.from_rotvec((0, 90, 0), degrees=True)
                 
             child.rotate_from_angax(360/disks*i, 'z', anchor=0)
             self.add(child)
@@ -149,40 +155,135 @@ class MagnetRing(magpy.Collection):
         return self
     
 def run_piston_length_analysis(cylinder_radius, stroke, resolution, magnet_radius, magnet_height, magnet_disks, num_sensors, sensor_type, magnet_type, sensor_offset, magnet_ring_radius_factor=0.95, magnet_orientation='radius', magnetization_direction='z', temperature=20, kalman_r=1e-6, voltage_noise=0.01, hc_variation=0.05, window=20, plot=True):
-    sensor_positions = np.linspace(sensor_offset, (stroke*0.0254)-2*(sensor_offset*0.0254), num_sensors)
+    # Set random seed for reproducibility
+    np.random.seed(42)
+    sensor_positions = np.linspace(sensor_offset*0.0254, (stroke*0.0254)-(sensor_offset*0.0254), num_sensors)
     sensors = [magpy.Sensor(position=(pos, 0, cylinder_radius*0.0254)) for pos in sensor_positions]
-    actual_positions = np.linspace(0, stroke*0.0254, _RESOLUTION)
+    
+    # Use the passed resolution parameter to build position grid
+    step = resolution * 0.0254  # Convert inches to meters
+    actual_positions = np.arange(0, stroke*0.0254 + step/2, step)
     sensor_sensitivity = SENSOR_DATABASE[sensor_type]['sensitivity']
 
     magnet_ring = MagnetRing(cylinder_radius*magnet_ring_radius_factor, magnet_radius, magnet_height, magnet_type, magnet_disks, orientation=magnet_orientation, magnetization=magnetization_direction, temperature=temperature, hc_variation=hc_variation)
     magnet_ring.rotate_from_angax(angle=90, axis='y')
     
-    # print(f"Using {magnet_type} magnet at {temperature}°C:")
-    # print(f"  Br = {MAGNET_DATABASE[magnet_type]['Br'](temperature):.3f} T")
-    # print(f"  Hc = {MAGNET_DATABASE[magnet_type]['Hc'](temperature):.0f} A/m")
-    # print(f"  Hc variation: ±{hc_variation*100:.1f}% (1-sigma)")
-    # print(f"  Sensor drift: ±{SENSOR_DATABASE[sensor_type]['max_drift']*100:.1f}% max")
-    # print(f"  Voltage noise: ±{voltage_noise:.3f} V (1-sigma)")
-    # print(f"  Search window: ±{window} positions")
+    if plot:  # Only print details when plotting
+        print(f"Using {magnet_type} magnet at {temperature}°C:")
+        print(f"  Br = {MAGNET_DATABASE[magnet_type]['Br'](temperature):.3f} T")
+        print(f"  Hc = {MAGNET_DATABASE[magnet_type]['Hc'](temperature):.0f} A/m")
+        print(f"  Hc variation: ±{hc_variation*100:.1f}% (1-sigma)")
+        
+        print(f"Using {sensor_type} sensor:")
+        sensor_info = SENSOR_DATABASE[sensor_type]
+        if sensor_info['type'] == 'digital':
+            print(f"  Type: Digital threshold sensor")
+            print(f"  Threshold: {sensor_info['sensitivity']:.1f} mT")
+            print(f"  Output: 5V when B > threshold, 0V otherwise")
+        elif sensor_info['type'] == 'magnitude':
+            print(f"  Type: Analog magnitude sensor")
+            if 'transfer_function' in sensor_info:
+                field_min, field_max = sensor_info['field_range_mT']
+                volt_min, volt_max = sensor_info['voltage_range_V']
+                print(f"  Field range: {field_min:.0f} to {field_max:.0f} mT ({field_min*10:.0f} to {field_max*10:.0f} Gauss)")
+                print(f"  Output range: {volt_min:.1f} to {volt_max:.1f} V (clamped)")
+                print(f"  Zero field output: {sensor_info['transfer_function'](0):.1f} V")
+            else:
+                print(f"  Sensitivity: {sensor_info['sensitivity']:.1f} mV/mT")
+                print(f"  Output: Proportional voltage")
+        elif sensor_info['type'] == '3-axis':
+            print(f"  Type: 3-axis digital sensor")
+            print(f"  Sensitivity: {sensor_info['sensitivity']:.1f} LSB/mT")
+            print(f"  Output: Digital counts (converted to 0-3.3V)")
+        
+        print(f"  Sensor drift: ±{sensor_info['max_drift']*100:.1f}% max")
+        print(f"  Voltage noise: ±{voltage_noise:.3f} V (1-sigma)")
+        print(f"  Search window: ±{window} positions")
     
     positions_3d = np.column_stack([actual_positions, np.zeros_like(actual_positions), np.zeros_like(actual_positions)])
     magnet_ring.position = positions_3d
     
-    # print("Computing magnetic fields...")
+    if plot:
+        print("Computing magnetic fields...")
+    
+    # Build CLEAN calibration table (no drift, no noise, no hc_variation, but same temperature)
+    calibration_magnet_ring = MagnetRing(cylinder_radius*magnet_ring_radius_factor, magnet_radius, magnet_height, magnet_type, magnet_disks, orientation=magnet_orientation, magnetization=magnetization_direction, temperature=temperature, hc_variation=0.0)  # Clean but same temperature
+    calibration_magnet_ring.rotate_from_angax(angle=90, axis='y')
+    
+    positions_3d = np.column_stack([actual_positions, np.zeros_like(actual_positions), np.zeros_like(actual_positions)])
+    calibration_magnet_ring.position = positions_3d
+    
     calibration_voltages = np.zeros((len(actual_positions), len(sensors)))
+    
+    for j, sensor in enumerate(sensors):
+        B_fields = calibration_magnet_ring.getB(sensor)
+        
+        # Generate CLEAN sensor output based on sensor type (no drift, no noise)
+        if SENSOR_DATABASE[sensor_type]['type'] == 'digital':
+            B_magnitudes = np.linalg.norm(B_fields, axis=1) * 1000  # Convert T to mT
+            threshold = sensor_sensitivity  # mT threshold
+            base_voltages = (B_magnitudes > threshold).astype(float) * 5.0  # 5V when above threshold
+        
+        elif SENSOR_DATABASE[sensor_type]['type'] == 'magnitude':
+            sensor_info = SENSOR_DATABASE[sensor_type]
+            if 'transfer_function' in sensor_info:
+                # Use signed Z-component for Hall effect sensors to get full range
+                B_z_signed = B_fields[:, 2] * 1000  # Z-component in mT (signed)
+                base_voltages = np.array([sensor_info['transfer_function'](B_z) for B_z in B_z_signed])
+            else:
+                # Fallback to old linear method using magnitude
+                B_magnitudes = np.linalg.norm(B_fields, axis=1) * 1000  # Convert T to mT
+                sensitivity_V_per_mT = sensor_sensitivity / 1000.0  # Convert mV/mT to V/mT
+                base_voltages = B_magnitudes * sensitivity_V_per_mT
+        
+        elif SENSOR_DATABASE[sensor_type]['type'] == '3-axis':
+            B_magnitudes = np.linalg.norm(B_fields, axis=1) * 1000  # Convert T to mT
+            sensitivity_LSB_per_mT = sensor_sensitivity
+            digital_counts = B_magnitudes * sensitivity_LSB_per_mT
+            # Convert to voltage assuming 3.3V reference and 12-bit ADC
+            base_voltages = (digital_counts / 4096) * 3.3
+        
+        calibration_voltages[:, j] = base_voltages  # Clean calibration data
+    
+    # Now generate NOISY measurement voltages with real-world effects
+    magnet_ring.position = positions_3d
+    measurement_voltages = np.zeros((len(actual_positions), len(sensors)))
     max_drift = SENSOR_DATABASE[sensor_type]['max_drift']
     
     for j, sensor in enumerate(sensors):
-        B_fields = magnet_ring.getB(sensor)
-        B_magnitudes = np.linalg.norm(B_fields, axis=1)
-        base_voltages = B_magnitudes * sensor_sensitivity
+        B_fields = magnet_ring.getB(sensor)  # Uses the magnet ring with temperature, hc_variation, etc.
+        
+        # Generate sensor output based on sensor type
+        if SENSOR_DATABASE[sensor_type]['type'] == 'digital':
+            B_magnitudes = np.linalg.norm(B_fields, axis=1) * 1000  # Convert T to mT
+            threshold = sensor_sensitivity  # mT threshold
+            base_voltages = (B_magnitudes > threshold).astype(float) * 5.0  # 5V when above threshold
+        
+        elif SENSOR_DATABASE[sensor_type]['type'] == 'magnitude':
+            sensor_info = SENSOR_DATABASE[sensor_type]
+            if 'transfer_function' in sensor_info:
+                # Use signed Z-component for Hall effect sensors to get full range
+                B_z_signed = B_fields[:, 2] * 1000  # Z-component in mT (signed)
+                base_voltages = np.array([sensor_info['transfer_function'](B_z) for B_z in B_z_signed])
+            else:
+                # Fallback to old linear method using magnitude
+                B_magnitudes = np.linalg.norm(B_fields, axis=1) * 1000  # Convert T to mT
+                sensitivity_V_per_mT = sensor_sensitivity / 1000.0  # Convert mV/mT to V/mT
+                base_voltages = B_magnitudes * sensitivity_V_per_mT
+        
+        elif SENSOR_DATABASE[sensor_type]['type'] == '3-axis':
+            B_magnitudes = np.linalg.norm(B_fields, axis=1) * 1000  # Convert T to mT
+            sensitivity_LSB_per_mT = sensor_sensitivity
+            digital_counts = B_magnitudes * sensitivity_LSB_per_mT
+            # Convert to voltage assuming 3.3V reference and 12-bit ADC
+            base_voltages = (digital_counts / 4096) * 3.3
         
         # Apply individual sensor drift (each sensor drifts independently)
         drift_factor = np.random.uniform(-max_drift, max_drift)
         drift_progression = np.linspace(0, drift_factor, len(actual_positions))
         drifted_voltages = base_voltages * (1 + drift_progression)
         
-        calibration_voltages[:, j] = drifted_voltages
+        measurement_voltages[:, j] = drifted_voltages
 
     estimated_positions = []
     filtered_positions = []
@@ -195,9 +296,11 @@ def run_piston_length_analysis(cylinder_radius, stroke, resolution, magnet_radiu
     k_var = 1.0
     k_pos = actual_positions[0]
 
-    for i, meas_volts in enumerate(calibration_voltages):
-        # print(f"\rProcessing step {i+1}/{len(calibration_voltages)}", end='', flush=True)
+    for i, meas_volts in enumerate(measurement_voltages):
+        if plot:
+            print(f"\rProcessing step {i+1}/{len(measurement_voltages)}", end='', flush=True)
         
+        # Add measurement noise on top of the already noisy measurement voltages
         noisy_volts = meas_volts + np.random.normal(0, voltage_noise, len(meas_volts))
         noisy_voltages.append(noisy_volts)
         
@@ -208,10 +311,19 @@ def run_piston_length_analysis(cylinder_radius, stroke, resolution, magnet_radiu
             prev_idx = sliding_window_search(noisy_volts, calibration_voltages, prev_idx, window)
             est_pos = actual_positions[prev_idx]
             
+            # Debug: Check if we're getting reasonable results
+            if plot and i % 500 == 0:  # Print every 500th step
+                actual_pos_in = actual_positions[i] / 0.0254
+                est_pos_in = est_pos / 0.0254
+                print(f"\nStep {i}: Actual={actual_pos_in:.2f}in, Estimated={est_pos_in:.2f}in, Error={abs(actual_pos_in-est_pos_in):.2f}in")
+                print(f"  Meas volts: [{noisy_volts[0]:.3f}, {noisy_volts[1]:.3f}, {noisy_volts[2]:.3f}...]")
+                print(f"  Cal volts at actual pos: [{calibration_voltages[i][0]:.3f}, {calibration_voltages[i][1]:.3f}, {calibration_voltages[i][2]:.3f}...]")
+                print(f"  Cal volts at est pos: [{calibration_voltages[prev_idx][0]:.3f}, {calibration_voltages[prev_idx][1]:.3f}, {calibration_voltages[prev_idx][2]:.3f}...]")
+            
             # Check for tracking failure
-            # if abs(est_pos - actual_positions[i]) > 0.1:  # 100mm threshold
-            #     print(f"\nWarning: Possible tracking failure at step {i+1}")
-            #     print(f"  Estimated: {est_pos/0.0254:.1f} in, Actual: {actual_positions[i]/0.0254:.1f} in")
+            if plot and abs(est_pos - actual_positions[i]) > 0.1:  # 100mm threshold
+                print(f"\nWarning: Possible tracking failure at step {i+1}")
+                print(f"  Estimated: {est_pos/0.0254:.1f} in, Actual: {actual_positions[i]/0.0254:.1f} in")
         estimated_positions.append(est_pos)
 
         k_pos, k_var = kalman_update(est_pos, k_pos, k_var, q, r)
@@ -225,9 +337,10 @@ def run_piston_length_analysis(cylinder_radius, stroke, resolution, magnet_radiu
     noisy_voltages = np.array(noisy_voltages)
     all_voltages = noisy_voltages
     
-    # print(f"\nMean position error: {np.mean(position_errors)/0.0254:.3f} inches")
-    # print(f"Max position error: {np.max(position_errors)/0.0254:.3f} inches")
-    # print(f"Position accuracy (1-sigma): {np.std(position_errors)/0.0254:.3f} inches")
+    if plot:
+        print(f"\nMean position error: {np.mean(position_errors)/0.0254:.3f} inches")
+        print(f"Max position error: {np.max(position_errors)/0.0254:.3f} inches")
+        print(f"Position accuracy (1-sigma): {np.std(position_errors)/0.0254:.3f} inches")
     
     if plot:
         plot_frames = 100
@@ -285,170 +398,193 @@ if __name__ == "__main__":
     import time
     from datetime import datetime
     
-    # Parameter sweep configuration
-    parameters = {
-        'resolution': [0.05],
-        'magnet_radius': [0.125, 0.25, 0.5],
-        'magnet_height': [0.125, 0.25],
-        'magnet_disks': [6],
-        'magnet_ring_radius_factor': [0.85, 0.9, 0.95],
-        'num_sensors': [6, 8, 10, 12],
-        'sensor_type': ["OMH3150S"],
-        'magnet_type': ["N52", "N42"],
-        'sensor_offset': [0.0, 0.5, 1.0],
-        'magnet_orientation': ['radius'],
-        'magnetization_direction': ['z'],
-        'temperature': [-10, 0, 10],
-        'kalman_r': [1e-6, 1e-4],
-        'voltage_noise': [0.05],
-        'hc_variation': [0.1],
-        'window': [20]
-    }
+    if not RUN_SWEEP:
+        position_errors_low = run_piston_length_analysis(
+            cylinder_radius=CYLINDER_RADIUS,
+            stroke=STROKE,
+            resolution=0.001,
+            magnet_radius=0.25,
+            magnet_height=0.125,
+            magnet_disks=6,
+            num_sensors=10,
+            sensor_type="OMH3150S",
+            magnet_type="N52",
+            sensor_offset=1.0,
+            magnet_ring_radius_factor=0.875,
+            magnet_orientation='x',
+            magnetization_direction='z',
+            temperature=-10,
+            kalman_r=1e-4,
+            voltage_noise=0.01,
+            hc_variation=0.05,
+            window=200,
+            plot=True
+        )
+    else:
+        # Parameter sweep configuration
+        parameters = {
+            'resolution': [0.05],
+            'magnet_radius': [0.125, 0.25, 0.5],
+            'magnet_height': [0.125, 0.25],
+            'magnet_disks': [6],
+            'magnet_ring_radius_factor': [0.85, 0.9, 0.95],
+            'num_sensors': [6, 8, 10, 12],
+            'sensor_type': ["OMH3150S"],
+            'magnet_type': ["N52", "N42"],
+            'sensor_offset': [0.0, 0.5, 1.0],
+            'magnet_orientation': ['radius'],
+            'magnetization_direction': ['z'],
+            'temperature': [-10, 0, 10],
+            'kalman_r': [1e-6, 1e-4],
+            'voltage_noise': [0.05],
+            'hc_variation': [0.1],
+            'window': [20]
+        }
+        
+        # Calculate total combinations
+        total_combinations = 1
+        for param_list in parameters.values():
+            total_combinations *= len(param_list)
+        
+        print(f"Starting comprehensive parameter sweep...")
+        print(f"Total combinations: {total_combinations:,}")
+        
+        # Results storage
+        results_data = []
+        combination_count = 0
+        start_time = time.time()
     
-    # Calculate total combinations
-    total_combinations = 1
-    for param_list in parameters.values():
-        total_combinations *= len(param_list)
-    
-    print(f"Starting comprehensive parameter sweep...")
-    print(f"Total combinations: {total_combinations:,}")
-    
-    # Results storage
-    results_data = []
-    combination_count = 0
-    start_time = time.time()
-    
-    # Nested loops for all parameter combinations
-    for resolution in parameters['resolution']:
-        for mag_radius in parameters['magnet_radius']:
-            for mag_height in parameters['magnet_height']:
-                for mag_disks in parameters['magnet_disks']:
-                    for mag_ring_radius_factor in parameters['magnet_ring_radius_factor']:
-                        for num_sens in parameters['num_sensors']:
-                            for sens_type in parameters['sensor_type']:
-                                for mag_type in parameters['magnet_type']:
-                                    for sens_offset in parameters['sensor_offset']:
-                                        for mag_orient in parameters['magnet_orientation']:
-                                            for mag_direction in parameters['magnetization_direction']:
-                                                for temp in parameters['temperature']:
-                                                    for kalman_r in parameters['kalman_r']:
-                                                        for v_noise in parameters['voltage_noise']:
-                                                            for hc_var in parameters['hc_variation']:
-                                                                for window in parameters['window']:
-                                                                    combination_count += 1
-                                                                    
-                                                                    # Progress update
-                                                                    if combination_count % 100 == 0:
-                                                                        elapsed = time.time() - start_time
-                                                                        rate = combination_count / elapsed
-                                                                        eta = (total_combinations - combination_count) / rate
-                                                                        #print(f"Progress: {combination_count:,}/{total_combinations:,} ({combination_count/total_combinations*100:.1f}%) - ETA: {eta/60:.1f} min")
-                                                                    
-                                                                    # Skip invalid combinations
-                                                                    if sens_offset >= STROKE * 0.8:
-                                                                        continue
-                                                                    
-                                                                    try:
-                                                                        # Run analysis
-                                                                        position_errors = run_piston_length_analysis(
-                                                                            cylinder_radius=CYLINDER_RADIUS,
-                                                                            stroke=STROKE,
-                                                                            resolution=resolution,
-                                                                            magnet_radius=mag_radius,
-                                                                            magnet_height=mag_height,
-                                                                            magnet_disks=mag_disks,
-                                                                            num_sensors=num_sens,
-                                                                            sensor_type=sens_type,
-                                                                            magnet_type=mag_type,
-                                                                            sensor_offset=sens_offset,
-                                                                            magnet_ring_radius_factor=mag_ring_radius_factor,
-                                                                            magnet_orientation=mag_orient,
-                                                                            magnetization_direction=mag_direction,
-                                                                            temperature=temp,
-                                                                            kalman_r=kalman_r,
-                                                                            voltage_noise=v_noise,
-                                                                            hc_variation=hc_var,
-                                                                            window=window,
-                                                                            plot=False
-                                                                        )
+        # Nested loops for all parameter combinations
+        for resolution in parameters['resolution']:
+            for mag_radius in parameters['magnet_radius']:
+                for mag_height in parameters['magnet_height']:
+                    for mag_disks in parameters['magnet_disks']:
+                        for mag_ring_radius_factor in parameters['magnet_ring_radius_factor']:
+                            for num_sens in parameters['num_sensors']:
+                                for sens_type in parameters['sensor_type']:
+                                    for mag_type in parameters['magnet_type']:
+                                        for sens_offset in parameters['sensor_offset']:
+                                            for mag_orient in parameters['magnet_orientation']:
+                                                for mag_direction in parameters['magnetization_direction']:
+                                                    for temp in parameters['temperature']:
+                                                        for kalman_r in parameters['kalman_r']:
+                                                            for v_noise in parameters['voltage_noise']:
+                                                                for hc_var in parameters['hc_variation']:
+                                                                    for window in parameters['window']:
+                                                                        combination_count += 1
                                                                         
-                                                                        # Store results
-                                                                        result = {
-                                                                            'combination': combination_count,
-                                                                            'resolution': resolution,
-                                                                            'magnet_radius': mag_radius,
-                                                                            'magnet_height': mag_height,
-                                                                            'magnet_disks': mag_disks,
-                                                                            'magnet_ring_radius_factor': mag_ring_radius_factor,
-                                                                            'num_sensors': num_sens,
-                                                                            'sensor_type': sens_type,
-                                                                            'magnet_type': mag_type,
-                                                                            'sensor_offset': sens_offset,
-                                                                            'magnet_orientation': mag_orient,
-                                                                            'magnetization_direction': mag_direction,
-                                                                            'temperature': temp,
-                                                                            'kalman_r': kalman_r,
-                                                                            'voltage_noise': v_noise,
-                                                                            'hc_variation': hc_var,
-                                                                            'window': window,
-                                                                            'mean_error_mm': float(np.mean(position_errors) * 1000),
-                                                                            'max_error_mm': float(np.max(position_errors) * 1000),
-                                                                            'std_error_mm': float(np.std(position_errors) * 1000),
-                                                                            'mean_error_percent': float(np.mean(position_errors) / (STROKE * 0.0254) * 100),
-                                                                            'max_error_percent': float(np.max(position_errors) / (STROKE * 0.0254) * 100),
-                                                                            'positions_within_5_percent': float(np.sum(position_errors / (STROKE * 0.0254) < 0.05) / len(position_errors) * 100)
-                                                                        }
-                                                                        results_data.append(result)
+                                                                        # Progress update
+                                                                        if combination_count % 100 == 0:
+                                                                            elapsed = time.time() - start_time
+                                                                            rate = combination_count / elapsed
+                                                                            eta = (total_combinations - combination_count) / rate
+                                                                            #print(f"Progress: {combination_count:,}/{total_combinations:,} ({combination_count/total_combinations*100:.1f}%) - ETA: {eta/60:.1f} min")
                                                                         
-                                                                        # Print best results so far
-                                                                        # if result['mean_error_percent'] < 2.0:
-                                                                        #     print(f"  Good result: {result['mean_error_percent']:.2f}% avg error")
-                                                                        #     print(f"    Config: {num_sens} sensors, {sens_type}, {mag_type}, {temp}°C, noise={v_noise:.3f}")
-                                                                    
-                                                                    except Exception as e:
-                                                                        print(f"  Error in combination {combination_count}: {e}")
-                                                                        continue
-    
-    # Convert to DataFrame
-    results_df = pd.DataFrame(results_data)
-    
-    # Save results to files
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    csv_filename = f"parameter_sweep_results_{timestamp}.csv"
-    pickle_filename = f"parameter_sweep_results_{timestamp}.pkl"
-    
-    results_df.to_csv(csv_filename, index=False)
-    results_df.to_pickle(pickle_filename)
-    
-    print(f"\nParameter sweep completed!")
-    print(f"Total combinations tested: {len(results_df):,}")
-    print(f"Results saved to: {csv_filename} and {pickle_filename}")
-    print(f"Total time: {(time.time() - start_time)/60:.1f} minutes")
-    
-    # Print summary statistics
-    if not results_df.empty:
-        print(f"\nSummary:")
-        print(f"Best mean error: {results_df['mean_error_percent'].min():.2f}%")
-        print(f"Worst mean error: {results_df['mean_error_percent'].max():.2f}%")
-        print(f"Average mean error: {results_df['mean_error_percent'].mean():.2f}%")
-        print(f"Configurations with <5% error: {len(results_df[results_df['mean_error_percent'] < 5.0])}/{len(results_df)}")
+                                                                        # Skip invalid combinations
+                                                                        if sens_offset >= STROKE * 0.8:
+                                                                            continue
+                                                                        
+                                                                        try:
+                                                                            # Run analysis
+                                                                            position_errors = run_piston_length_analysis(
+                                                                                cylinder_radius=CYLINDER_RADIUS,
+                                                                                stroke=STROKE,
+                                                                                resolution=resolution,
+                                                                                magnet_radius=mag_radius,
+                                                                                magnet_height=mag_height,
+                                                                                magnet_disks=mag_disks,
+                                                                                num_sensors=num_sens,
+                                                                                sensor_type=sens_type,
+                                                                                magnet_type=mag_type,
+                                                                                sensor_offset=sens_offset,
+                                                                                magnet_ring_radius_factor=mag_ring_radius_factor,
+                                                                                magnet_orientation=mag_orient,
+                                                                                magnetization_direction=mag_direction,
+                                                                                temperature=temp,
+                                                                                kalman_r=kalman_r,
+                                                                                voltage_noise=v_noise,
+                                                                                hc_variation=hc_var,
+                                                                                window=window,
+                                                                                plot=False
+                                                                            )
+                                                                            
+                                                                            # Store results
+                                                                            result = {
+                                                                                'combination': combination_count,
+                                                                                'resolution': resolution,
+                                                                                'magnet_radius': mag_radius,
+                                                                                'magnet_height': mag_height,
+                                                                                'magnet_disks': mag_disks,
+                                                                                'magnet_ring_radius_factor': mag_ring_radius_factor,
+                                                                                'num_sensors': num_sens,
+                                                                                'sensor_type': sens_type,
+                                                                                'magnet_type': mag_type,
+                                                                                'sensor_offset': sens_offset,
+                                                                                'magnet_orientation': mag_orient,
+                                                                                'magnetization_direction': mag_direction,
+                                                                                'temperature': temp,
+                                                                                'kalman_r': kalman_r,
+                                                                                'voltage_noise': v_noise,
+                                                                                'hc_variation': hc_var,
+                                                                                'window': window,
+                                                                                'mean_error_mm': float(np.mean(position_errors) * 1000),
+                                                                                'max_error_mm': float(np.max(position_errors) * 1000),
+                                                                                'std_error_mm': float(np.std(position_errors) * 1000),
+                                                                                'mean_error_percent': float(np.mean(position_errors) / (STROKE * 0.0254) * 100),
+                                                                                'max_error_percent': float(np.max(position_errors) / (STROKE * 0.0254) * 100),
+                                                                                'positions_within_5_percent': float(np.sum(position_errors / (STROKE * 0.0254) < 0.05) / len(position_errors) * 100)
+                                                                            }
+                                                                            results_data.append(result)
+                                                                            
+                                                                            # Print best results so far
+                                                                            # if result['mean_error_percent'] < 2.0:
+                                                                            #     print(f"  Good result: {result['mean_error_percent']:.2f}% avg error")
+                                                                            #     print(f"    Config: {num_sens} sensors, {sens_type}, {mag_type}, {temp}°C, noise={v_noise:.3f}")
+                                                                        
+                                                                        except Exception as e:
+                                                                            print(f"  Error in combination {combination_count}: {e}")
+                                                                            continue
         
-        # Find best configuration
-        best_row = results_df.loc[results_df['mean_error_percent'].idxmin()]
-        print(f"\nBest configuration:")
-        param_cols = ['resolution', 'magnet_radius', 'magnet_height', 'magnet_disks', 'magnet_ring_radius_factor', 
-                     'num_sensors', 'sensor_type', 'magnet_type', 'sensor_offset', 
-                     'magnet_orientation', 'magnetization_direction', 'temperature', 'kalman_r', 
-                     'voltage_noise', 'hc_variation', 'window']
-        for param in param_cols:
-            print(f"  {param}: {best_row[param]}")
-        print(f"  Mean error: {best_row['mean_error_percent']:.2f}%")
+        # Convert to DataFrame
+        results_df = pd.DataFrame(results_data)
         
-        # Additional pandas analysis
-        print(f"\nTop 5 sensor types by mean error:")
-        sensor_analysis = results_df.groupby('sensor_type')['mean_error_percent'].agg(['mean', 'min', 'count']).sort_values('mean')
-        print(sensor_analysis)
+        # Save results to files
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_filename = f"parameter_sweep_results_{timestamp}.csv"
+        pickle_filename = f"parameter_sweep_results_{timestamp}.pkl"
         
-        print(f"\nTop 5 magnet types by mean error:")
-        magnet_analysis = results_df.groupby('magnet_type')['mean_error_percent'].agg(['mean', 'min', 'count']).sort_values('mean')
-        print(magnet_analysis)
+        results_df.to_csv(csv_filename, index=False)
+        results_df.to_pickle(pickle_filename)
+        
+        print(f"\nParameter sweep completed!")
+        print(f"Total combinations tested: {len(results_df):,}")
+        print(f"Results saved to: {csv_filename} and {pickle_filename}")
+        print(f"Total time: {(time.time() - start_time)/60:.1f} minutes")
+        
+        # Print summary statistics
+        if not results_df.empty:
+            print(f"\nSummary:")
+            print(f"Best mean error: {results_df['mean_error_percent'].min():.2f}%")
+            print(f"Worst mean error: {results_df['mean_error_percent'].max():.2f}%")
+            print(f"Average mean error: {results_df['mean_error_percent'].mean():.2f}%")
+            print(f"Configurations with <5% error: {len(results_df[results_df['mean_error_percent'] < 5.0])}/{len(results_df)}")
+            
+            # Find best configuration
+            best_row = results_df.loc[results_df['mean_error_percent'].idxmin()]
+            print(f"\nBest configuration:")
+            param_cols = ['resolution', 'magnet_radius', 'magnet_height', 'magnet_disks', 'magnet_ring_radius_factor', 
+                         'num_sensors', 'sensor_type', 'magnet_type', 'sensor_offset', 
+                         'magnet_orientation', 'magnetization_direction', 'temperature', 'kalman_r', 
+                         'voltage_noise', 'hc_variation', 'window']
+            for param in param_cols:
+                print(f"  {param}: {best_row[param]}")
+            print(f"  Mean error: {best_row['mean_error_percent']:.2f}%")
+            
+            # Additional pandas analysis
+            print(f"\nTop 5 sensor types by mean error:")
+            sensor_analysis = results_df.groupby('sensor_type')['mean_error_percent'].agg(['mean', 'min', 'count']).sort_values('mean')
+            print(sensor_analysis)
+            
+            print(f"\nTop 5 magnet types by mean error:")
+            magnet_analysis = results_df.groupby('magnet_type')['mean_error_percent'].agg(['mean', 'min', 'count']).sort_values('mean')
+            print(magnet_analysis)
